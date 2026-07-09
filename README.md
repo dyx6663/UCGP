@@ -102,9 +102,10 @@ defaults:
   lambda_phys: 0.03
   eot_enabled: true
   tps_enabled: true
+  patch_view_enabled: true
 ```
 
-These defaults match the main paper setting as closely as possible from the local script: `G=5`, `max_samples=300`, `pop=50`, `gens=100`, black patch color, `roi_core_div=4.0`, `lambda_topo=0.12`, `lambda_budget=0.03`, and physical robustness transforms enabled. Following the AdvGrid-style pipeline, EOT samples random affine, photometric, and sensor-noise perturbations on the final adversarial image, while TPS applies a smooth thin-plate-spline deformation to the rendered perturbation mask before it is pasted into the target region. Set `eot_enabled: false` or `tps_enabled: false` for the corresponding ablation.
+These defaults match the main paper setting as closely as possible from the local script: `G=5`, `max_samples=300`, `pop=50`, `gens=100`, black patch color, `roi_core_div=4.0`, `lambda_topo=0.12`, `lambda_budget=0.03`, and physical robustness transforms enabled. The robustness layer uses lightweight physical sampling: EOT perturbs the final adversarial image, TPS deforms the rendered patch mask, and `patch_view_*` applies mild patch-level scale, translation, rotation, and shear jitter before pasting. Set `eot_enabled: false`, `tps_enabled: false`, or `patch_view_enabled: false` for ablations.
 
 ## Quick Check
 

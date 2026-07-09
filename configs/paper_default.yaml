@@ -49,6 +49,13 @@ defaults:
   tps_grid_size: 3
   tps_max_displace: 0.05
 
+  # Mild patch-level multi-scale/multi-view attachment jitter.
+  patch_view_enabled: true
+  patch_view_rotate_deg: 4.0
+  patch_view_scale_jitter: 0.04
+  patch_view_translate: 0.03
+  patch_view_shear: 0.04
+
 runs:
   - name: openai_clip_vit_l_14
     clip_model_id: openai/clip-vit-large-patch14

@@ -135,6 +135,12 @@ TPS_ENABLED = True
 TPS_GRID_SIZE = 3
 TPS_MAX_DISPLACE = 0.05
 
+PATCH_VIEW_ENABLED = True
+PATCH_VIEW_ROTATE_DEG = 4.0
+PATCH_VIEW_SCALE_JITTER = 0.04
+PATCH_VIEW_TRANSLATE = 0.03
+PATCH_VIEW_SHEAR = 0.04
+
 PATCH_COLOR_RGB = (0, 0, 0)
 DARKEN_STRENGTH = 0.85
 
@@ -918,7 +924,7 @@ def _eval_tps(points: torch.Tensor, ctrl_from: torch.Tensor, weights: torch.Tens
 
 
 def _sample_eot_tps_params(batch_size: int, image_shape, device):
-    if not (_as_bool(EOT_ENABLED) or _as_bool(TPS_ENABLED)):
+    if not (_as_bool(EOT_ENABLED) or _as_bool(TPS_ENABLED) or _as_bool(PATCH_VIEW_ENABLED)):
         return None
     b = int(batch_size)
     c, h, w = map(int, image_shape)
@@ -969,6 +975,27 @@ def _sample_eot_tps_params(batch_size: int, image_shape, device):
         params["tps_ctrl"] = ctrl
         params["tps_target"] = (ctrl.unsqueeze(0) + disp).clamp(-1.15, 1.15)
 
+    if _as_bool(PATCH_VIEW_ENABLED):
+        max_angle = math.radians(float(max(0.0, PATCH_VIEW_ROTATE_DEG)))
+        angle = _rand_uniform((b,), -max_angle, max_angle, device)
+        scale_jitter = float(max(0.0, PATCH_VIEW_SCALE_JITTER))
+        scale = _rand_uniform((b,), 1.0 - scale_jitter, 1.0 + scale_jitter, device).clamp_min(0.05)
+        tx = _rand_uniform((b,), -float(max(0.0, PATCH_VIEW_TRANSLATE)), float(max(0.0, PATCH_VIEW_TRANSLATE)), device)
+        ty = _rand_uniform((b,), -float(max(0.0, PATCH_VIEW_TRANSLATE)), float(max(0.0, PATCH_VIEW_TRANSLATE)), device)
+        shear_x = _rand_uniform((b,), -float(max(0.0, PATCH_VIEW_SHEAR)), float(max(0.0, PATCH_VIEW_SHEAR)), device)
+        shear_y = _rand_uniform((b,), -float(max(0.0, PATCH_VIEW_SHEAR)), float(max(0.0, PATCH_VIEW_SHEAR)), device)
+
+        cos_v = torch.cos(angle) / scale
+        sin_v = torch.sin(angle) / scale
+        patch_affine = torch.zeros((b, 2, 3), device=device, dtype=torch.float32)
+        patch_affine[:, 0, 0] = cos_v
+        patch_affine[:, 0, 1] = -sin_v + shear_x
+        patch_affine[:, 1, 0] = sin_v + shear_y
+        patch_affine[:, 1, 1] = cos_v
+        patch_affine[:, 0, 2] = tx
+        patch_affine[:, 1, 2] = ty
+        params["patch_affine"] = patch_affine
+
     return params if params else None
 
 
@@ -999,6 +1026,26 @@ def _apply_tps_batch(imgs: torch.Tensor, params: dict) -> torch.Tensor:
             warped_i = imgs[i:i + 1]
         warped.append(warped_i)
     return torch.cat(warped, dim=0)
+
+
+def _apply_patch_view_batch(mask: torch.Tensor, params: dict, batch_index: int) -> torch.Tensor:
+    patch_affine = params.get("patch_affine", None) if params is not None else None
+    if patch_affine is None or mask is None or mask.numel() == 0:
+        return mask
+    idx = int(batch_index)
+    if idx < 0 or idx >= int(patch_affine.shape[0]):
+        return mask
+    orig_dtype = mask.dtype
+    affine = patch_affine[idx:idx + 1].to(device=mask.device, dtype=torch.float32)
+    grid = F.affine_grid(affine, size=mask.shape, align_corners=False)
+    warped = F.grid_sample(
+        mask.float(),
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=False,
+    )
+    return warped.to(dtype=orig_dtype).clamp(0.0, 1.0)
 
 
 def _apply_eot_tps_batch(
@@ -1452,6 +1499,8 @@ class FastGPUFullImageEvaluator:
                 if small_mask_full is None:
                     small_mask_full = F.interpolate(mask_tensor, size=(target_h, target_w), mode="bilinear", align_corners=False)
                     _resize_cache[key] = small_mask_full
+                if _as_bool(PATCH_VIEW_ENABLED) and eot_params is not None:
+                    small_mask_full = _apply_patch_view_batch(small_mask_full, eot_params, i_local)
                 if _as_bool(TPS_ENABLED) and eot_params is not None:
                     tps_target = eot_params.get("tps_target", None)
                     tps_ctrl = eot_params.get("tps_ctrl", None)
@@ -2765,6 +2814,11 @@ def save_checkpoint(
         tps_enabled=bool(TPS_ENABLED),
         tps_grid_size=int(TPS_GRID_SIZE),
         tps_max_displace=float(TPS_MAX_DISPLACE),
+        patch_view_enabled=bool(PATCH_VIEW_ENABLED),
+        patch_view_rotate_deg=float(PATCH_VIEW_ROTATE_DEG),
+        patch_view_scale_jitter=float(PATCH_VIEW_SCALE_JITTER),
+        patch_view_translate=float(PATCH_VIEW_TRANSLATE),
+        patch_view_shear=float(PATCH_VIEW_SHEAR),
         gen=int(gen),
         G=int(bounds_G),
         pop=np.array(pop, dtype=object),
@@ -2966,6 +3020,11 @@ def export_theta_pack_from_ckpt(ckpt_path: str, out_dir: str, export_name: str =
         TPS_ENABLED=np.array(bool(TPS_ENABLED), dtype=bool),
         TPS_GRID_SIZE=np.int32(TPS_GRID_SIZE),
         TPS_MAX_DISPLACE=np.float32(TPS_MAX_DISPLACE),
+        PATCH_VIEW_ENABLED=np.array(bool(PATCH_VIEW_ENABLED), dtype=bool),
+        PATCH_VIEW_ROTATE_DEG=np.float32(PATCH_VIEW_ROTATE_DEG),
+        PATCH_VIEW_SCALE_JITTER=np.float32(PATCH_VIEW_SCALE_JITTER),
+        PATCH_VIEW_TRANSLATE=np.float32(PATCH_VIEW_TRANSLATE),
+        PATCH_VIEW_SHEAR=np.float32(PATCH_VIEW_SHEAR),
         FAST_RENDER_LINE_SAMPLES=np.int32(FAST_RENDER_LINE_SAMPLES),
         GATE_THR=np.float32(GATE_THR),
         THETA_QUANT=np.float32(THETA_QUANT),
@@ -3434,6 +3493,8 @@ def run_one(cfg: dict, det_model):
     global EOT_ENABLED, EOT_ROTATE_DEG, EOT_SCALE_JITTER, EOT_TRANSLATE
     global EOT_BRIGHTNESS, EOT_CONTRAST, EOT_NOISE_STD
     global TPS_ENABLED, TPS_GRID_SIZE, TPS_MAX_DISPLACE
+    global PATCH_VIEW_ENABLED, PATCH_VIEW_ROTATE_DEG, PATCH_VIEW_SCALE_JITTER
+    global PATCH_VIEW_TRANSLATE, PATCH_VIEW_SHEAR
 
     IMG_DIR = cfg.get("img_dir", cfg.get("IMG_DIR", cfg.get("clean_dir", cfg.get("CLEAN_DIR", ""))))
     OUT_DIR = cfg.get("out_dir", cfg.get("OUT_DIR", "./out_run_one"))
@@ -3470,6 +3531,11 @@ def run_one(cfg: dict, det_model):
     TPS_ENABLED = _as_bool(cfg.get("tps_enabled", cfg.get("TPS_ENABLED", TPS_ENABLED)))
     TPS_GRID_SIZE = int(cfg.get("tps_grid_size", cfg.get("TPS_GRID_SIZE", TPS_GRID_SIZE)))
     TPS_MAX_DISPLACE = float(cfg.get("tps_max_displace", cfg.get("TPS_MAX_DISPLACE", TPS_MAX_DISPLACE)))
+    PATCH_VIEW_ENABLED = _as_bool(cfg.get("patch_view_enabled", cfg.get("PATCH_VIEW_ENABLED", PATCH_VIEW_ENABLED)))
+    PATCH_VIEW_ROTATE_DEG = float(cfg.get("patch_view_rotate_deg", cfg.get("PATCH_VIEW_ROTATE_DEG", PATCH_VIEW_ROTATE_DEG)))
+    PATCH_VIEW_SCALE_JITTER = float(cfg.get("patch_view_scale_jitter", cfg.get("PATCH_VIEW_SCALE_JITTER", PATCH_VIEW_SCALE_JITTER)))
+    PATCH_VIEW_TRANSLATE = float(cfg.get("patch_view_translate", cfg.get("PATCH_VIEW_TRANSLATE", PATCH_VIEW_TRANSLATE)))
+    PATCH_VIEW_SHEAR = float(cfg.get("patch_view_shear", cfg.get("PATCH_VIEW_SHEAR", PATCH_VIEW_SHEAR)))
 
     log(f"[RUN] out_dir={OUT_DIR}", level=0)
     log(f"[RUN] img_dir={IMG_DIR}", level=0)
@@ -3480,6 +3546,12 @@ def run_one(cfg: dict, det_model):
         f"[RUN] EOT={EOT_ENABLED} rot={EOT_ROTATE_DEG:.2f} scale_jitter={EOT_SCALE_JITTER:.3f} "
         f"translate={EOT_TRANSLATE:.3f} brightness={EOT_BRIGHTNESS:.3f} contrast={EOT_CONTRAST:.3f} "
         f"noise={EOT_NOISE_STD:.4f} | TPS={TPS_ENABLED} grid={TPS_GRID_SIZE} max_disp={TPS_MAX_DISPLACE:.3f}",
+        level=0,
+    )
+    log(
+        f"[RUN] patch_view={PATCH_VIEW_ENABLED} rot={PATCH_VIEW_ROTATE_DEG:.2f} "
+        f"scale_jitter={PATCH_VIEW_SCALE_JITTER:.3f} translate={PATCH_VIEW_TRANSLATE:.3f} "
+        f"shear={PATCH_VIEW_SHEAR:.3f}",
         level=0,
     )
 
@@ -3589,6 +3661,7 @@ def _save_single_run_result(run_out_dir: str, result: dict):
         f"lambda_budget: {float(payload.get('lambda_budget', 0.0)):.2f}\n"
         f"eot_enabled: {payload.get('eot_enabled', EOT_ENABLED)}\n"
         f"tps_enabled: {payload.get('tps_enabled', TPS_ENABLED)}\n"
+        f"patch_view_enabled: {payload.get('patch_view_enabled', PATCH_VIEW_ENABLED)}\n"
         f"asr_of_best_loss: {asr_str}\n"
         f"best_loss: {loss_str}\n"
         f"status: {payload.get('status', 'unknown')}\n"
@@ -3659,6 +3732,7 @@ def run_many(runs, detector_config: str, detector_ckpt: str, score_thr: float = 
             "lambda_budget": float(run_cfg.get("lambda_phys", run_cfg.get("LAMBDA_PHYS", LAMBDA_PHYS))),
             "eot_enabled": _as_bool(run_cfg.get("eot_enabled", run_cfg.get("EOT_ENABLED", EOT_ENABLED))),
             "tps_enabled": _as_bool(run_cfg.get("tps_enabled", run_cfg.get("TPS_ENABLED", TPS_ENABLED))),
+            "patch_view_enabled": _as_bool(run_cfg.get("patch_view_enabled", run_cfg.get("PATCH_VIEW_ENABLED", PATCH_VIEW_ENABLED))),
             "G": int(run_cfg.get("G", G)),
             "roi_core_div": float(run_cfg.get("roi_core_div", run_cfg.get("ROI_CORE_DIV", ROI_CORE_DIV))),
             "out_dir": run_cfg.get("out_dir", run_cfg.get("OUT_DIR", "./outputs/run_one")),
@@ -3697,7 +3771,7 @@ def main():
         f"G=5 | delta={EXPANSION_RATIO:.2f} | pop={DE_POP} | gens={DE_GENS} | "
         f"lambda_topo={LAMBDA_TOPO:.2f} | lambda_budget={LAMBDA_PHYS:.2f} | "
         f"roi_core_div={ROI_CORE_DIV:.2f} | thickness_ratio={THICKNESS_TO_CELL_RATIO:.2f} | "
-        f"patch_color={PATCH_COLOR_RGB} | EOT={EOT_ENABLED} | TPS={TPS_ENABLED} | "
+        f"patch_color={PATCH_COLOR_RGB} | EOT={EOT_ENABLED} | TPS={TPS_ENABLED} | patch_view={PATCH_VIEW_ENABLED} | "
         f"max_samples={MAX_SAMPLES} | Objective=LOSS_ONLY\n",
         level=0,
     )
@@ -3721,6 +3795,7 @@ def main():
             "lambda_budget": 0.03,
             "eot_enabled": bool(EOT_ENABLED),
             "tps_enabled": bool(TPS_ENABLED),
+            "patch_view_enabled": bool(PATCH_VIEW_ENABLED),
             "G": 5,
             "roi_core_div": 4.0,
             "out_dir": run_cfg.get("out_dir", run_cfg.get("OUT_DIR", "./out_run_one")),
@@ -3736,7 +3811,7 @@ def main():
                 f"\n>>> [MODEL {model_idx}/{len(RUNS)}] {name} | "
                 f"G=5 | delta={EXPANSION_RATIO:.2f} | pop=50 | gens=100 | "
                 f"lambda_topo=0.12 | lambda_budget=0.03 | roi_core_div=4.0 | patch_color=(0, 0, 0) | "
-                f"EOT={EOT_ENABLED} | TPS={TPS_ENABLED}",
+                f"EOT={EOT_ENABLED} | TPS={TPS_ENABLED} | patch_view={PATCH_VIEW_ENABLED}",
                 level=0,
             )
             log(f"[RUN] IMG_DIR={run_cfg.get('img_dir', run_cfg.get('IMG_DIR', ''))}", level=0)
@@ -3757,7 +3832,7 @@ def main():
     log(
         f"[DONE] Fixed-parameter runs finished | G=5 | delta={EXPANSION_RATIO:.2f} | pop=50 | gens=100 | "
         f"lambda_topo=0.12 | lambda_budget=0.03 | roi_core_div=4.0 | patch_color=(0, 0, 0) | "
-        f"EOT={EOT_ENABLED} | TPS={TPS_ENABLED} | max_samples=300 | objective=LOSS_ONLY",
+        f"EOT={EOT_ENABLED} | TPS={TPS_ENABLED} | patch_view={PATCH_VIEW_ENABLED} | max_samples=300 | objective=LOSS_ONLY",
         level=0
     )
 

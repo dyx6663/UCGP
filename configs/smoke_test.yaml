@@ -39,6 +39,11 @@ defaults:
   tps_enabled: true
   tps_grid_size: 3
   tps_max_displace: 0.05
+  patch_view_enabled: true
+  patch_view_rotate_deg: 4.0
+  patch_view_scale_jitter: 0.04
+  patch_view_translate: 0.03
+  patch_view_shear: 0.04
 
 runs:
   - name: smoke_openai_clip
