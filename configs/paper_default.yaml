@@ -1,0 +1,55 @@
+# UCGP paper-style default configuration.
+# Replace all placeholder paths with your local dataset, detector, and CLIP checkpoints.
+
+runtime:
+  seed: 42
+  device: cuda:0
+  log_level: 1
+  clip_batch_size: 32
+  save_images_on_best_full: true
+
+detector:
+  config: /path/to/mmdet/yolov3.py
+  checkpoint: /path/to/yolov3_person_detector.pth
+  score_thr: 0.5
+
+defaults:
+  img_dir: /path/to/infrared/images
+  output_root: ./outputs
+  max_samples: 300
+  person_id: 0
+
+  # Curved-Grid Mesh (CGM) and physical patch settings used in the paper.
+  G: 5
+  master_size: 512
+  roi_core_div: 4.0
+  patch_color: [0, 0, 0]
+  darken_strength: 0.85
+
+  # MetaDE search budget.
+  pop_size: 50
+  de_gens: 100
+
+  # Representation-level objective.
+  lambda_topo: 0.12
+  lambda_phys: 0.03
+  cvar_q: 0.50
+  ev_rank: 16
+
+runs:
+  - name: openai_clip_vit_l_14
+    clip_model_id: openai/clip-vit-large-patch14
+    clip_ckpt: null
+
+  - name: openclip_vit_b_16_datacomp_xl
+    clip_model_id: /path/to/CLIP-ViT-B-16-DataComp.XL-s13B-b90K
+    clip_ckpt: /path/to/finetuned_openclip_checkpoint.bin
+
+  - name: metaclip_vit_l_14
+    clip_model_id: /path/to/vit_large_patch14_clip_224.metaclip_2pt5b
+    clip_ckpt: /path/to/finetuned_metaclip_checkpoint.bin
+
+  - name: eva_clip_vit_g_14
+    clip_model_id: /path/to/eva_giant_patch14_plus_clip_224.merged2b_s11b_b114k
+    clip_ckpt: /path/to/finetuned_eva_clip_checkpoint.bin
+

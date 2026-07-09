@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ucgp"
+version = "0.1.0"
+description = "Universal Curved-Grid Patch for infrared vision-language model robustness auditing"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  {name = "UCGP Authors"}
+]
+dependencies = [
+  "numpy>=1.23",
+  "opencv-python>=4.8",
+  "pillow>=9.5",
+  "tqdm>=4.65",
+  "pyyaml>=6.0",
+  "torch>=2.0",
+  "torchvision>=0.15",
+  "transformers>=4.36",
+]
+
+[project.scripts]
+ucgp = "ucgp.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ucgp*"]
+

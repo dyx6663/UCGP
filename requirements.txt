@@ -1,0 +1,14 @@
+numpy>=1.23
+opencv-python>=4.8
+pillow>=9.5
+tqdm>=4.65
+pyyaml>=6.0
+torch>=2.0
+torchvision>=0.15
+transformers>=4.36
+
+# Optional but recommended for the detector used in the paper.
+# Install a version compatible with your CUDA/PyTorch stack:
+# mmcv
+# mmdet
+

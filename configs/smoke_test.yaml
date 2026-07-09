@@ -1,0 +1,37 @@
+# Lightweight configuration for checking installation and data paths.
+# It keeps the same pipeline but uses a tiny optimization budget.
+
+runtime:
+  seed: 42
+  device: cuda:0
+  log_level: 1
+  clip_batch_size: 8
+  save_images_on_best_full: false
+
+detector:
+  config: /path/to/mmdet/yolov3.py
+  checkpoint: /path/to/yolov3_person_detector.pth
+  score_thr: 0.5
+
+defaults:
+  img_dir: /path/to/infrared/images
+  output_root: ./outputs_smoke
+  max_samples: 8
+  person_id: 0
+  G: 5
+  master_size: 512
+  roi_core_div: 4.0
+  patch_color: [0, 0, 0]
+  darken_strength: 0.85
+  pop_size: 4
+  de_gens: 2
+  lambda_topo: 0.12
+  lambda_phys: 0.03
+  cvar_q: 0.50
+  ev_rank: 4
+
+runs:
+  - name: smoke_openai_clip
+    clip_model_id: openai/clip-vit-large-patch14
+    clip_ckpt: null
+
