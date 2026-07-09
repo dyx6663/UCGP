@@ -100,9 +100,11 @@ defaults:
   de_gens: 100
   lambda_topo: 0.12
   lambda_phys: 0.03
+  eot_enabled: true
+  tps_enabled: true
 ```
 
-These defaults match the main paper setting as closely as possible from the local script: `G=5`, `max_samples=300`, `pop=50`, `gens=100`, black patch color, `roi_core_div=4.0`, `lambda_topo=0.12`, and `lambda_budget=0.03`.
+These defaults match the main paper setting as closely as possible from the local script: `G=5`, `max_samples=300`, `pop=50`, `gens=100`, black patch color, `roi_core_div=4.0`, `lambda_topo=0.12`, `lambda_budget=0.03`, and physical robustness transforms enabled. Following the AdvGrid-style pipeline, EOT samples random affine, photometric, and sensor-noise perturbations on the final adversarial image, while TPS applies a smooth thin-plate-spline deformation to the rendered perturbation mask before it is pasted into the target region. Set `eot_enabled: false` or `tps_enabled: false` for the corresponding ablation.
 
 ## Quick Check
 
@@ -162,15 +164,17 @@ python tools/render_theta.py \
 ## Citation
 
 ```bibtex
-@article{hu2026ucgp,
-  title={Revealing Physical-World Semantic Vulnerabilities: Universal Adversarial Patch for Infrared Vision-Language Models},
-  author={Hu, Chengyin and Dong, Yuxian and Guo, Yikun and Chen, Xiang and Zhang, Qike and Wu, Junqi and Long, Jiahuan and Wei, Yiwei and Jiang, Tingsong and Yao, Wen},
-  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence},
-  year={2026}
+@misc{hu2026ucgp,
+  title={Revealing Physical-World Semantic Vulnerabilities: Universal Adversarial Patches for Infrared Vision-Language Models},
+  author={Hu, Chengyin and Dong, Yuxian and Guo, Yikun and Chen, Xiang and Wu, Junqi and Long, Jiahuan and Wei, Yiwei and Jiang, Tingsong and Yao, Wen},
+  year={2026},
+  eprint={2604.03117},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  doi={10.48550/arXiv.2604.03117},
+  url={https://arxiv.org/abs/2604.03117}
 }
 ```
-
-Update the BibTeX entry after the final publication metadata is available.
 
 ## Responsible Use
 

@@ -36,6 +36,19 @@ defaults:
   cvar_q: 0.50
   ev_rank: 16
 
+  # Physical-world robustness transforms.
+  eot_enabled: true
+  eot_rotate_deg: 8.0
+  eot_scale_jitter: 0.08
+  eot_translate: 0.06
+  eot_brightness: 0.04
+  eot_contrast: 0.08
+  eot_noise_std: 0.005
+
+  tps_enabled: true
+  tps_grid_size: 3
+  tps_max_displace: 0.05
+
 runs:
   - name: openai_clip_vit_l_14
     clip_model_id: openai/clip-vit-large-patch14
@@ -52,4 +65,3 @@ runs:
   - name: eva_clip_vit_g_14
     clip_model_id: /path/to/eva_giant_patch14_plus_clip_224.merged2b_s11b_b114k
     clip_ckpt: /path/to/finetuned_eva_clip_checkpoint.bin
-

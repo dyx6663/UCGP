@@ -29,9 +29,18 @@ defaults:
   lambda_phys: 0.03
   cvar_q: 0.50
   ev_rank: 4
+  eot_enabled: true
+  eot_rotate_deg: 8.0
+  eot_scale_jitter: 0.08
+  eot_translate: 0.06
+  eot_brightness: 0.04
+  eot_contrast: 0.08
+  eot_noise_std: 0.005
+  tps_enabled: true
+  tps_grid_size: 3
+  tps_max_displace: 0.05
 
 runs:
   - name: smoke_openai_clip
     clip_model_id: openai/clip-vit-large-patch14
     clip_ckpt: null
-

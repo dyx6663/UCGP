@@ -88,6 +88,12 @@ def log(msg: str, level: int = 1):
     print(f"[{t}] {msg}", flush=True)
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def set_global_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -116,6 +122,18 @@ CVAR_Q = 0.50
 EV_SUBSPACE_RANK = 16
 LAMBDA_TOPO = 0.12
 LAMBDA_PHYS = 0.03
+
+EOT_ENABLED = True
+EOT_ROTATE_DEG = 8.0
+EOT_SCALE_JITTER = 0.08
+EOT_TRANSLATE = 0.06
+EOT_BRIGHTNESS = 0.04
+EOT_CONTRAST = 0.08
+EOT_NOISE_STD = 0.005
+
+TPS_ENABLED = True
+TPS_GRID_SIZE = 3
+TPS_MAX_DISPLACE = 0.05
 
 PATCH_COLOR_RGB = (0, 0, 0)
 DARKEN_STRENGTH = 0.85
@@ -768,6 +786,288 @@ def make_patch_color_tensor_norm(clip_processor, patch_color_rgb, device, dtype,
     v = pv.mean(dim=(2, 3), keepdim=True)
     return v.to(device=device, dtype=dtype)
 
+
+_NORMALIZED_GRID_CACHE = {}
+
+
+def _coerce_rgb_stats(value, default):
+    try:
+        if value is None:
+            return list(default)
+        if isinstance(value, torch.Tensor):
+            value = value.detach().float().cpu().flatten().tolist()
+        elif isinstance(value, np.ndarray):
+            value = value.astype(np.float32).reshape(-1).tolist()
+        elif not isinstance(value, (list, tuple)):
+            return list(default)
+        if len(value) >= 3:
+            return [float(value[0]), float(value[1]), float(value[2])]
+    except Exception:
+        pass
+    return list(default)
+
+
+def _get_clip_image_mean_std(clip_processor):
+    default_mean = [0.48145466, 0.45782750, 0.40821073]
+    default_std = [0.26862954, 0.26130258, 0.27577711]
+    candidates = [clip_processor]
+    for attr in ("processor", "hf", "image_processor"):
+        obj = getattr(clip_processor, attr, None)
+        if obj is not None:
+            candidates.append(obj)
+            ip = getattr(obj, "image_processor", None)
+            if ip is not None:
+                candidates.append(ip)
+
+    for obj in candidates:
+        mean = getattr(obj, "image_mean", None)
+        std = getattr(obj, "image_std", None)
+        if mean is not None and std is not None:
+            return _coerce_rgb_stats(mean, default_mean), _coerce_rgb_stats(std, default_std)
+
+    try:
+        tr = getattr(clip_processor, "transform", None)
+        ts = getattr(tr, "transforms", None)
+        ts = ts if isinstance(ts, (list, tuple)) else ([tr] if tr is not None else [])
+        for t in ts:
+            name = t.__class__.__name__.lower()
+            if "normalize" in name and hasattr(t, "mean") and hasattr(t, "std"):
+                return _coerce_rgb_stats(t.mean, default_mean), _coerce_rgb_stats(t.std, default_std)
+    except Exception:
+        pass
+
+    return default_mean, default_std
+
+
+def _get_clip_norm_tensors(clip_processor, device, dtype=torch.float32):
+    mean, std = _get_clip_image_mean_std(clip_processor)
+    mean_t = torch.tensor(mean, device=device, dtype=dtype).view(1, 3, 1, 1)
+    std_t = torch.tensor(std, device=device, dtype=dtype).view(1, 3, 1, 1).clamp_min(1e-6)
+    return mean_t, std_t
+
+
+def _rand_uniform(shape, low: float, high: float, device):
+    low = float(low)
+    high = float(high)
+    if high <= low:
+        return torch.full(shape, low, device=device, dtype=torch.float32)
+    return torch.empty(shape, device=device, dtype=torch.float32).uniform_(low, high)
+
+
+def _meshgrid_ij(y: torch.Tensor, x: torch.Tensor):
+    try:
+        return torch.meshgrid(y, x, indexing="ij")
+    except TypeError:
+        return torch.meshgrid(y, x)
+
+
+def _normalized_grid_points(h: int, w: int, device):
+    key = (str(device), int(h), int(w))
+    grid = _NORMALIZED_GRID_CACHE.get(key, None)
+    if grid is not None:
+        return grid
+    ys = torch.linspace(-1.0, 1.0, int(h), device=device, dtype=torch.float32)
+    xs = torch.linspace(-1.0, 1.0, int(w), device=device, dtype=torch.float32)
+    yy, xx = _meshgrid_ij(ys, xs)
+    grid = torch.stack((xx, yy), dim=-1)
+    _NORMALIZED_GRID_CACHE[key] = grid
+    return grid
+
+
+def _thin_plate_kernel(r2: torch.Tensor) -> torch.Tensor:
+    return 0.5 * r2 * torch.log(r2.clamp_min(1e-6))
+
+
+def _make_tps_control_points(grid_size: int, device):
+    g = max(2, int(grid_size))
+    coords = torch.linspace(-1.0, 1.0, g, device=device, dtype=torch.float32)
+    yy, xx = _meshgrid_ij(coords, coords)
+    return torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
+
+
+def _solve_tps(ctrl_from: torch.Tensor, ctrl_to: torch.Tensor):
+    k = int(ctrl_from.shape[0])
+    diff = ctrl_from[:, None, :] - ctrl_from[None, :, :]
+    r2 = (diff * diff).sum(dim=-1)
+    kmat = _thin_plate_kernel(r2)
+    pmat = torch.cat(
+        [torch.ones((k, 1), device=ctrl_from.device, dtype=torch.float32), ctrl_from],
+        dim=1,
+    )
+    upper = torch.cat([kmat, pmat], dim=1)
+    lower = torch.cat(
+        [pmat.t(), torch.zeros((3, 3), device=ctrl_from.device, dtype=torch.float32)],
+        dim=1,
+    )
+    lhs = torch.cat([upper, lower], dim=0)
+    rhs = torch.cat(
+        [ctrl_to, torch.zeros((3, 2), device=ctrl_from.device, dtype=torch.float32)],
+        dim=0,
+    )
+    reg = torch.eye(k + 3, device=ctrl_from.device, dtype=torch.float32) * 1e-5
+    reg[k:, k:] = 0.0
+    params = torch.linalg.solve(lhs + reg, rhs)
+    return params[:k], params[k:]
+
+
+def _eval_tps(points: torch.Tensor, ctrl_from: torch.Tensor, weights: torch.Tensor, affine: torch.Tensor):
+    diff = points[:, None, :] - ctrl_from[None, :, :]
+    r2 = (diff * diff).sum(dim=-1)
+    umat = _thin_plate_kernel(r2)
+    return affine[0].unsqueeze(0) + points @ affine[1:] + umat @ weights
+
+
+def _sample_eot_tps_params(batch_size: int, image_shape, device):
+    if not (_as_bool(EOT_ENABLED) or _as_bool(TPS_ENABLED)):
+        return None
+    b = int(batch_size)
+    c, h, w = map(int, image_shape)
+    params = {}
+
+    if _as_bool(EOT_ENABLED):
+        max_angle = math.radians(float(max(0.0, EOT_ROTATE_DEG)))
+        angle = _rand_uniform((b,), -max_angle, max_angle, device)
+        scale_jitter = float(max(0.0, EOT_SCALE_JITTER))
+        scale = _rand_uniform((b,), 1.0 - scale_jitter, 1.0 + scale_jitter, device).clamp_min(0.05)
+        tx = _rand_uniform((b,), -float(max(0.0, EOT_TRANSLATE)), float(max(0.0, EOT_TRANSLATE)), device)
+        ty = _rand_uniform((b,), -float(max(0.0, EOT_TRANSLATE)), float(max(0.0, EOT_TRANSLATE)), device)
+
+        cos_v = torch.cos(angle) / scale
+        sin_v = torch.sin(angle) / scale
+        affine = torch.zeros((b, 2, 3), device=device, dtype=torch.float32)
+        affine[:, 0, 0] = cos_v
+        affine[:, 0, 1] = -sin_v
+        affine[:, 1, 0] = sin_v
+        affine[:, 1, 1] = cos_v
+        affine[:, 0, 2] = tx
+        affine[:, 1, 2] = ty
+        params["affine"] = affine
+
+        contrast = _rand_uniform(
+            (b,),
+            1.0 - float(max(0.0, EOT_CONTRAST)),
+            1.0 + float(max(0.0, EOT_CONTRAST)),
+            device,
+        ).clamp_min(0.05)
+        brightness = _rand_uniform(
+            (b,),
+            -float(max(0.0, EOT_BRIGHTNESS)),
+            float(max(0.0, EOT_BRIGHTNESS)),
+            device,
+        )
+        params["contrast"] = contrast
+        params["brightness"] = brightness
+        if float(EOT_NOISE_STD) > 0:
+            params["noise"] = torch.randn((b, c, h, w), device=device, dtype=torch.float32) * float(EOT_NOISE_STD)
+
+    if _as_bool(TPS_ENABLED) and float(TPS_MAX_DISPLACE) > 0:
+        ctrl = _make_tps_control_points(int(TPS_GRID_SIZE), device)
+        k = int(ctrl.shape[0])
+        disp = _rand_uniform((b, k, 2), -float(TPS_MAX_DISPLACE), float(TPS_MAX_DISPLACE), device)
+        boundary = ((ctrl[:, 0].abs() > 0.99) | (ctrl[:, 1].abs() > 0.99)).float()
+        disp = disp * (1.0 - 0.65 * boundary.view(1, k, 1))
+        params["tps_ctrl"] = ctrl
+        params["tps_target"] = (ctrl.unsqueeze(0) + disp).clamp(-1.15, 1.15)
+
+    return params if params else None
+
+
+def _apply_tps_batch(imgs: torch.Tensor, params: dict) -> torch.Tensor:
+    targets = params.get("tps_target", None) if params is not None else None
+    ctrl = params.get("tps_ctrl", None) if params is not None else None
+    if targets is None or ctrl is None:
+        return imgs
+
+    b, _, h, w = imgs.shape
+    points = _normalized_grid_points(h, w, imgs.device).reshape(-1, 2)
+    ctrl = ctrl.to(device=imgs.device, dtype=torch.float32)
+    targets = targets.to(device=imgs.device, dtype=torch.float32)
+    warped = []
+    for i in range(int(b)):
+        try:
+            weights, affine = _solve_tps(targets[i], ctrl)
+            src_points = _eval_tps(points, targets[i], weights, affine)
+            grid = src_points.view(1, h, w, 2).clamp(-1.25, 1.25)
+            warped_i = F.grid_sample(
+                imgs[i:i + 1],
+                grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=False,
+            )
+        except RuntimeError:
+            warped_i = imgs[i:i + 1]
+        warped.append(warped_i)
+    return torch.cat(warped, dim=0)
+
+
+def _apply_eot_tps_batch(
+    batch_imgs: torch.Tensor,
+    eot_params: dict = None,
+    norm_mean: torch.Tensor = None,
+    norm_std: torch.Tensor = None,
+    apply_tps: bool = True,
+) -> torch.Tensor:
+    if batch_imgs is None or batch_imgs.numel() == 0:
+        return batch_imgs
+    if not _as_bool(EOT_ENABLED) and not (_as_bool(TPS_ENABLED) and bool(apply_tps)):
+        return batch_imgs
+
+    orig_dtype = batch_imgs.dtype
+    imgs_norm = batch_imgs.float()
+    b, c, h, w = imgs_norm.shape
+    params = eot_params
+    if params is None:
+        params = _sample_eot_tps_params(int(b), (int(c), int(h), int(w)), imgs_norm.device)
+    if params is None:
+        return batch_imgs
+
+    if norm_mean is None or norm_std is None:
+        norm_mean = torch.tensor(
+            [0.48145466, 0.45782750, 0.40821073],
+            device=imgs_norm.device,
+            dtype=torch.float32,
+        ).view(1, 3, 1, 1)
+        norm_std = torch.tensor(
+            [0.26862954, 0.26130258, 0.27577711],
+            device=imgs_norm.device,
+            dtype=torch.float32,
+        ).view(1, 3, 1, 1)
+    else:
+        norm_mean = norm_mean.to(device=imgs_norm.device, dtype=torch.float32)
+        norm_std = norm_std.to(device=imgs_norm.device, dtype=torch.float32)
+
+    norm_std = norm_std.clamp_min(1e-6)
+    imgs = (imgs_norm * norm_std + norm_mean).clamp(0.0, 1.0)
+
+    if _as_bool(EOT_ENABLED) and "affine" in params:
+        grid = F.affine_grid(
+            params["affine"].to(device=imgs.device, dtype=torch.float32),
+            size=imgs.shape,
+            align_corners=False,
+        )
+        imgs = F.grid_sample(imgs, grid, mode="bilinear", padding_mode="border", align_corners=False)
+
+        if "contrast" in params:
+            contrast = params["contrast"].to(device=imgs.device, dtype=torch.float32).view(b, 1, 1, 1)
+            mean = imgs.mean(dim=(2, 3), keepdim=True)
+            imgs = (imgs - mean) * contrast + mean
+        if "brightness" in params:
+            brightness = params["brightness"].to(device=imgs.device, dtype=torch.float32).view(b, 1, 1, 1)
+            imgs = imgs + brightness
+        if "noise" in params:
+            imgs = imgs + params["noise"].to(device=imgs.device, dtype=torch.float32)
+        imgs = imgs.clamp(0.0, 1.0)
+
+    if _as_bool(TPS_ENABLED) and bool(apply_tps):
+        imgs = _apply_tps_batch(imgs, params)
+
+    imgs = torch.nan_to_num(imgs, nan=0.0, posinf=10.0, neginf=-10.0)
+    imgs = imgs.clamp(0.0, 1.0)
+    imgs_norm = (imgs - norm_mean) / norm_std
+    return imgs_norm.to(dtype=orig_dtype)
+
+
 def decode_theta(theta: np.ndarray, G: int):
     gate_end = int(G * G)
     return theta[0:gate_end], theta[gate_end:]
@@ -1070,6 +1370,7 @@ class FastGPUFullImageEvaluator:
         self.clean_imgs_gpu = pv.to(self.device, dtype=torch.float16, non_blocking=True)
         self._mask_tensor_cache = OrderedDict()
         self._patch_color_cache = {}
+        self.norm_mean, self.norm_std = _get_clip_norm_tensors(self.clip_processor, self.device, dtype=torch.float32)
 
     def clear_mask_cache(self):
         try:
@@ -1109,7 +1410,10 @@ class FastGPUFullImageEvaluator:
         self._patch_color_cache[key] = t
         return t
 
-    def _apply_patch_batch(self, indices, theta, G: int, master_size: int, patch_color, darken_strength: float):
+    def sample_eot_tps_params(self, batch_size: int):
+        return _sample_eot_tps_params(int(batch_size), (3, int(self.S), int(self.S)), self.device)
+
+    def _apply_patch_batch(self, indices, theta, G: int, master_size: int, patch_color, darken_strength: float, eot_params=None):
         S = int(self.S)
         mask_tensor = self._get_mask_tensor_cached(theta, G=int(G), master_size=int(master_size))
         indices_tensor = torch.as_tensor(indices, device=self.device, dtype=torch.long)
@@ -1148,6 +1452,17 @@ class FastGPUFullImageEvaluator:
                 if small_mask_full is None:
                     small_mask_full = F.interpolate(mask_tensor, size=(target_h, target_w), mode="bilinear", align_corners=False)
                     _resize_cache[key] = small_mask_full
+                if _as_bool(TPS_ENABLED) and eot_params is not None:
+                    tps_target = eot_params.get("tps_target", None)
+                    tps_ctrl = eot_params.get("tps_ctrl", None)
+                    if tps_target is not None and tps_ctrl is not None and i_local < int(tps_target.shape[0]):
+                        small_mask_full = _apply_tps_batch(
+                            small_mask_full.float(),
+                            {
+                                "tps_ctrl": tps_ctrl,
+                                "tps_target": tps_target[i_local:i_local + 1],
+                            },
+                        ).to(dtype=mask_tensor.dtype).clamp(0.0, 1.0)
 
                 mx_off1 = ix1 - paste_x1
                 my_off1 = iy1 - paste_y1
@@ -1168,7 +1483,9 @@ class FastGPUFullImageEvaluator:
                 )
         return batch_imgs, budget_loss_sum
 
-    def forward_batch_full_image(self, indices, theta, G: int, master_size: int, patch_color, darken_strength: float):
+    def forward_batch_full_image(self, indices, theta, G: int, master_size: int, patch_color, darken_strength: float, eot_params=None):
+        if eot_params is None:
+            eot_params = self.sample_eot_tps_params(len(indices))
         batch_imgs_adv, budget_loss_sum = self._apply_patch_batch(
             indices=indices,
             theta=theta,
@@ -1176,6 +1493,14 @@ class FastGPUFullImageEvaluator:
             master_size=int(master_size),
             patch_color=patch_color,
             darken_strength=float(darken_strength),
+            eot_params=eot_params,
+        )
+        batch_imgs_adv = _apply_eot_tps_batch(
+            batch_imgs_adv,
+            eot_params=eot_params,
+            norm_mean=self.norm_mean,
+            norm_std=self.norm_std,
+            apply_tps=False,
         )
         with torch.inference_mode():
             model_dtype = next(self.clip_model.parameters()).dtype
@@ -1644,14 +1969,17 @@ def eval_pairwise_metrics_indices(theta_trial, theta_cur, imgs_rgb_in, bboxes_li
     for b0 in range(0, n_eval, GPU_BATCH):
         b1 = min(n_eval, b0 + GPU_BATCH)
         idx_chunk = indices[b0:b1]
+        eot_params = gpu_evaluator.sample_eot_tps_params(len(idx_chunk))
 
         img_feat_t, budget_sum_t_batch = gpu_evaluator.forward_batch_full_image(
             idx_chunk, theta_trial, G,
-            master_size=MASTER_SIZE, patch_color=PATCH_COLOR_RGB, darken_strength=DARKEN_STRENGTH
+            master_size=MASTER_SIZE, patch_color=PATCH_COLOR_RGB, darken_strength=DARKEN_STRENGTH,
+            eot_params=eot_params
         )
         img_feat_c, budget_sum_c_batch = gpu_evaluator.forward_batch_full_image(
             idx_chunk, theta_cur, G,
-            master_size=MASTER_SIZE, patch_color=PATCH_COLOR_RGB, darken_strength=DARKEN_STRENGTH
+            master_size=MASTER_SIZE, patch_color=PATCH_COLOR_RGB, darken_strength=DARKEN_STRENGTH,
+            eot_params=eot_params
         )
 
         budget_sum_t_total = budget_sum_t_total + budget_sum_t_batch
@@ -2427,6 +2755,16 @@ def save_checkpoint(
     np.savez(
         path,
         objective=np.array(["loss_only"], dtype=object),
+        eot_enabled=bool(EOT_ENABLED),
+        eot_rotate_deg=float(EOT_ROTATE_DEG),
+        eot_scale_jitter=float(EOT_SCALE_JITTER),
+        eot_translate=float(EOT_TRANSLATE),
+        eot_brightness=float(EOT_BRIGHTNESS),
+        eot_contrast=float(EOT_CONTRAST),
+        eot_noise_std=float(EOT_NOISE_STD),
+        tps_enabled=bool(TPS_ENABLED),
+        tps_grid_size=int(TPS_GRID_SIZE),
+        tps_max_displace=float(TPS_MAX_DISPLACE),
         gen=int(gen),
         G=int(bounds_G),
         pop=np.array(pop, dtype=object),
@@ -2618,6 +2956,16 @@ def export_theta_pack_from_ckpt(ckpt_path: str, out_dir: str, export_name: str =
         ALPHA_GAMMA=np.float32(ALPHA_GAMMA),
         DARKEN_STRENGTH=np.float32(DARKEN_STRENGTH),
         PATCH_COLOR_RGB=np.array(list(PATCH_COLOR_RGB), dtype=np.int32),
+        EOT_ENABLED=np.array(bool(EOT_ENABLED), dtype=bool),
+        EOT_ROTATE_DEG=np.float32(EOT_ROTATE_DEG),
+        EOT_SCALE_JITTER=np.float32(EOT_SCALE_JITTER),
+        EOT_TRANSLATE=np.float32(EOT_TRANSLATE),
+        EOT_BRIGHTNESS=np.float32(EOT_BRIGHTNESS),
+        EOT_CONTRAST=np.float32(EOT_CONTRAST),
+        EOT_NOISE_STD=np.float32(EOT_NOISE_STD),
+        TPS_ENABLED=np.array(bool(TPS_ENABLED), dtype=bool),
+        TPS_GRID_SIZE=np.int32(TPS_GRID_SIZE),
+        TPS_MAX_DISPLACE=np.float32(TPS_MAX_DISPLACE),
         FAST_RENDER_LINE_SAMPLES=np.int32(FAST_RENDER_LINE_SAMPLES),
         GATE_THR=np.float32(GATE_THR),
         THETA_QUANT=np.float32(THETA_QUANT),
@@ -3083,6 +3431,9 @@ def run_one(cfg: dict, det_model):
     global MAX_SAMPLES, DE_POP, DE_GENS, G, MASTER_SIZE
     global PATCH_COLOR_RGB, DARKEN_STRENGTH
     global LAMBDA_TOPO, LAMBDA_PHYS, CVAR_Q, EV_SUBSPACE_RANK
+    global EOT_ENABLED, EOT_ROTATE_DEG, EOT_SCALE_JITTER, EOT_TRANSLATE
+    global EOT_BRIGHTNESS, EOT_CONTRAST, EOT_NOISE_STD
+    global TPS_ENABLED, TPS_GRID_SIZE, TPS_MAX_DISPLACE
 
     IMG_DIR = cfg.get("img_dir", cfg.get("IMG_DIR", cfg.get("clean_dir", cfg.get("CLEAN_DIR", ""))))
     OUT_DIR = cfg.get("out_dir", cfg.get("OUT_DIR", "./out_run_one"))
@@ -3109,12 +3460,28 @@ def run_one(cfg: dict, det_model):
     LAMBDA_PHYS = float(cfg.get("lambda_phys", cfg.get("LAMBDA_PHYS", LAMBDA_PHYS)))
     CVAR_Q = float(cfg.get("cvar_q", cfg.get("CVAR_Q", CVAR_Q)))
     EV_SUBSPACE_RANK = int(cfg.get("ev_rank", cfg.get("EV_SUBSPACE_RANK", EV_SUBSPACE_RANK)))
+    EOT_ENABLED = _as_bool(cfg.get("eot_enabled", cfg.get("EOT_ENABLED", EOT_ENABLED)))
+    EOT_ROTATE_DEG = float(cfg.get("eot_rotate_deg", cfg.get("EOT_ROTATE_DEG", EOT_ROTATE_DEG)))
+    EOT_SCALE_JITTER = float(cfg.get("eot_scale_jitter", cfg.get("EOT_SCALE_JITTER", EOT_SCALE_JITTER)))
+    EOT_TRANSLATE = float(cfg.get("eot_translate", cfg.get("EOT_TRANSLATE", EOT_TRANSLATE)))
+    EOT_BRIGHTNESS = float(cfg.get("eot_brightness", cfg.get("EOT_BRIGHTNESS", EOT_BRIGHTNESS)))
+    EOT_CONTRAST = float(cfg.get("eot_contrast", cfg.get("EOT_CONTRAST", EOT_CONTRAST)))
+    EOT_NOISE_STD = float(cfg.get("eot_noise_std", cfg.get("EOT_NOISE_STD", EOT_NOISE_STD)))
+    TPS_ENABLED = _as_bool(cfg.get("tps_enabled", cfg.get("TPS_ENABLED", TPS_ENABLED)))
+    TPS_GRID_SIZE = int(cfg.get("tps_grid_size", cfg.get("TPS_GRID_SIZE", TPS_GRID_SIZE)))
+    TPS_MAX_DISPLACE = float(cfg.get("tps_max_displace", cfg.get("TPS_MAX_DISPLACE", TPS_MAX_DISPLACE)))
 
     log(f"[RUN] out_dir={OUT_DIR}", level=0)
     log(f"[RUN] img_dir={IMG_DIR}", level=0)
     log(f"[RUN] clip_model_id={CLIP_MODEL_ID}", level=0)
     log(f"[RUN] G={G} MASTER_SIZE={MASTER_SIZE} pop={DE_POP} gens={DE_GENS}", level=0)
     log(f"[RUN] objective=LOSS_ONLY | q={CVAR_Q} rank={EV_SUBSPACE_RANK} lam_topo={LAMBDA_TOPO} lam_budget={LAMBDA_PHYS}", level=0)
+    log(
+        f"[RUN] EOT={EOT_ENABLED} rot={EOT_ROTATE_DEG:.2f} scale_jitter={EOT_SCALE_JITTER:.3f} "
+        f"translate={EOT_TRANSLATE:.3f} brightness={EOT_BRIGHTNESS:.3f} contrast={EOT_CONTRAST:.3f} "
+        f"noise={EOT_NOISE_STD:.4f} | TPS={TPS_ENABLED} grid={TPS_GRID_SIZE} max_disp={TPS_MAX_DISPLACE:.3f}",
+        level=0,
+    )
 
     init_clip_batch(CLIP_MODEL_ID=CLIP_MODEL_ID, CLIP_CKPT=CLIP_CKPT)
     kept_paths, bboxes_list, true_labels = build_eval_set_sequential_top1_person(
@@ -3220,6 +3587,8 @@ def _save_single_run_result(run_out_dir: str, result: dict):
         f"model: {payload.get('model', '')}\n"
         f"lambda_topo: {float(payload.get('lambda_topo', 0.0)):.2f}\n"
         f"lambda_budget: {float(payload.get('lambda_budget', 0.0)):.2f}\n"
+        f"eot_enabled: {payload.get('eot_enabled', EOT_ENABLED)}\n"
+        f"tps_enabled: {payload.get('tps_enabled', TPS_ENABLED)}\n"
         f"asr_of_best_loss: {asr_str}\n"
         f"best_loss: {loss_str}\n"
         f"status: {payload.get('status', 'unknown')}\n"
@@ -3288,6 +3657,8 @@ def run_many(runs, detector_config: str, detector_ckpt: str, score_thr: float = 
             "patch_color_rgb": list(run_cfg.get("patch_color", run_cfg.get("PATCH_COLOR_RGB", PATCH_COLOR_RGB))),
             "lambda_topo": float(run_cfg.get("lambda_topo", run_cfg.get("LAMBDA_TOPO", LAMBDA_TOPO))),
             "lambda_budget": float(run_cfg.get("lambda_phys", run_cfg.get("LAMBDA_PHYS", LAMBDA_PHYS))),
+            "eot_enabled": _as_bool(run_cfg.get("eot_enabled", run_cfg.get("EOT_ENABLED", EOT_ENABLED))),
+            "tps_enabled": _as_bool(run_cfg.get("tps_enabled", run_cfg.get("TPS_ENABLED", TPS_ENABLED))),
             "G": int(run_cfg.get("G", G)),
             "roi_core_div": float(run_cfg.get("roi_core_div", run_cfg.get("ROI_CORE_DIV", ROI_CORE_DIV))),
             "out_dir": run_cfg.get("out_dir", run_cfg.get("OUT_DIR", "./outputs/run_one")),
@@ -3326,7 +3697,8 @@ def main():
         f"G=5 | delta={EXPANSION_RATIO:.2f} | pop={DE_POP} | gens={DE_GENS} | "
         f"lambda_topo={LAMBDA_TOPO:.2f} | lambda_budget={LAMBDA_PHYS:.2f} | "
         f"roi_core_div={ROI_CORE_DIV:.2f} | thickness_ratio={THICKNESS_TO_CELL_RATIO:.2f} | "
-        f"patch_color={PATCH_COLOR_RGB} | max_samples={MAX_SAMPLES} | Objective=LOSS_ONLY\n",
+        f"patch_color={PATCH_COLOR_RGB} | EOT={EOT_ENABLED} | TPS={TPS_ENABLED} | "
+        f"max_samples={MAX_SAMPLES} | Objective=LOSS_ONLY\n",
         level=0,
     )
 
@@ -3347,6 +3719,8 @@ def main():
             "patch_color_rgb": [0, 0, 0],
             "lambda_topo": 0.12,
             "lambda_budget": 0.03,
+            "eot_enabled": bool(EOT_ENABLED),
+            "tps_enabled": bool(TPS_ENABLED),
             "G": 5,
             "roi_core_div": 4.0,
             "out_dir": run_cfg.get("out_dir", run_cfg.get("OUT_DIR", "./out_run_one")),
@@ -3361,7 +3735,8 @@ def main():
             log(
                 f"\n>>> [MODEL {model_idx}/{len(RUNS)}] {name} | "
                 f"G=5 | delta={EXPANSION_RATIO:.2f} | pop=50 | gens=100 | "
-                f"lambda_topo=0.12 | lambda_budget=0.03 | roi_core_div=4.0 | patch_color=(0, 0, 0)",
+                f"lambda_topo=0.12 | lambda_budget=0.03 | roi_core_div=4.0 | patch_color=(0, 0, 0) | "
+                f"EOT={EOT_ENABLED} | TPS={TPS_ENABLED}",
                 level=0,
             )
             log(f"[RUN] IMG_DIR={run_cfg.get('img_dir', run_cfg.get('IMG_DIR', ''))}", level=0)
@@ -3381,7 +3756,8 @@ def main():
 
     log(
         f"[DONE] Fixed-parameter runs finished | G=5 | delta={EXPANSION_RATIO:.2f} | pop=50 | gens=100 | "
-        f"lambda_topo=0.12 | lambda_budget=0.03 | roi_core_div=4.0 | patch_color=(0, 0, 0) | max_samples=300 | objective=LOSS_ONLY",
+        f"lambda_topo=0.12 | lambda_budget=0.03 | roi_core_div=4.0 | patch_color=(0, 0, 0) | "
+        f"EOT={EOT_ENABLED} | TPS={TPS_ENABLED} | max_samples=300 | objective=LOSS_ONLY",
         level=0
     )
 

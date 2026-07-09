@@ -11,8 +11,6 @@ authors:
     given-names: Yikun
   - family-names: Chen
     given-names: Xiang
-  - family-names: Zhang
-    given-names: Qike
   - family-names: Wu
     given-names: Junqi
   - family-names: Long
@@ -29,7 +27,7 @@ version: "0.1.0"
 date-released: "2026-07-08"
 preferred-citation:
   type: article
-  title: "Revealing Physical-World Semantic Vulnerabilities: Universal Adversarial Patch for Infrared Vision-Language Models"
+  title: "Revealing Physical-World Semantic Vulnerabilities: Universal Adversarial Patches for Infrared Vision-Language Models"
   authors:
     - family-names: Hu
       given-names: Chengyin
@@ -39,8 +37,6 @@ preferred-citation:
       given-names: Yikun
     - family-names: Chen
       given-names: Xiang
-    - family-names: Zhang
-      given-names: Qike
     - family-names: Wu
       given-names: Junqi
     - family-names: Long
@@ -51,6 +47,7 @@ preferred-citation:
       given-names: Tingsong
     - family-names: Yao
       given-names: Wen
-  journal: "IEEE Transactions on Pattern Analysis and Machine Intelligence"
+  journal: "arXiv preprint arXiv:2604.03117"
+  doi: "10.48550/arXiv.2604.03117"
+  url: "https://arxiv.org/abs/2604.03117"
   year: 2026
-
